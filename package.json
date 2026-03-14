@@ -1,0 +1,19 @@
+{
+  "name": "echo-shopify",
+  "version": "1.0.0",
+  "description": "Echo Prime Technologies - Shopify Storefront Integration Worker",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240529.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.60.0"
+  }
+}

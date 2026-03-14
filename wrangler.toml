@@ -1,0 +1,32 @@
+name = "echo-shopify"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-shopify"
+database_id = "f3c88ecf-b3b5-4598-a743-39741126ba06"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "dc0f9af662ea43e9a3aa997735b65a07"
+
+[[services]]
+binding = "ECHO_CHAT"
+service = "echo-chat"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EPT_API"
+service = "ept-api"
+
+[triggers]
+crons = ["0 */6 * * *", "0 14 * * *"]
+
+[vars]
+STORE_DOMAIN = "echo-prime-tech"
+ENVIRONMENT = "production"
