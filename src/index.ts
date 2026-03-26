@@ -49,7 +49,7 @@ function log(level: string, component: string, message: string, extra: Record<st
 app.get('/health', (c) => {
   return c.json({
     status: 'ok',
-    version: '1.0.0',
+    version: '1.1.0',
     worker: 'echo-shopify',
     timestamp: new Date().toISOString(),
     shopify_store: c.env.SHOPIFY_STORE_DOMAIN || c.env.STORE_DOMAIN || 'not-configured',
@@ -62,12 +62,14 @@ app.get('/health', (c) => {
 const STOREFRONT_API_VERSION = '2024-10';
 
 async function storefrontQuery(env: Env, query: string, variables: Record<string, unknown> = {}): Promise<unknown> {
-  const domain = env.SHOPIFY_STORE_DOMAIN || env.STORE_DOMAIN;
+  const rawDomain = env.SHOPIFY_STORE_DOMAIN || env.STORE_DOMAIN;
   const token = env.SHOPIFY_STOREFRONT_TOKEN;
-  if (!domain || !token) {
+  if (!rawDomain || !token) {
     throw new Error('Shopify Storefront API not configured. Set SHOPIFY_STORE_DOMAIN and SHOPIFY_STOREFRONT_TOKEN secrets.');
   }
-  const url = `https://${domain}.myshopify.com/api/${STOREFRONT_API_VERSION}/graphql.json`;
+  // Handle both "store-name" and "store-name.myshopify.com" formats
+  const host = rawDomain.includes('.myshopify.com') ? rawDomain : `${rawDomain}.myshopify.com`;
+  const url = `https://${host}/api/${STOREFRONT_API_VERSION}/graphql.json`;
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
@@ -175,7 +177,8 @@ app.get('/api/products/:handle', async (c) => {
 // Create cart
 app.post('/api/cart/create', async (c) => {
   try {
-    const { lines } = await c.req.json<{ lines: Array<{ variantId: string; quantity: number }> }>();
+    const body = await c.req.json<{ lines?: Array<{ variantId: string; quantity: number }> }>().catch(() => ({ lines: [] }));
+    const lines = body.lines || [];
     const query = `mutation cartCreate($input: CartInput!) {
       cartCreate(input: $input) {
         cart {
@@ -190,7 +193,10 @@ app.post('/api/cart/create', async (c) => {
         userErrors { field message }
       }
     }`;
-    const input = { lines: lines.map(l => ({ merchandiseId: l.variantId, quantity: l.quantity })) };
+    const input: Record<string, unknown> = {};
+    if (lines.length > 0) {
+      input.lines = lines.map(l => ({ merchandiseId: l.variantId, quantity: l.quantity }));
+    }
     const data = await storefrontQuery(c.env, query, { input });
     log('info', 'cart', 'Cart created', { lines: lines.length });
     return c.json(data);
@@ -247,12 +253,13 @@ app.get('/api/cart/:cartId', async (c) => {
 const ADMIN_API_VERSION = '2024-10';
 
 async function adminQuery(env: Env, query: string, variables: Record<string, unknown> = {}): Promise<unknown> {
-  const domain = env.SHOPIFY_STORE_DOMAIN || env.STORE_DOMAIN;
+  const rawDomain = env.SHOPIFY_STORE_DOMAIN || env.STORE_DOMAIN;
   const token = env.SHOPIFY_ADMIN_TOKEN;
-  if (!domain || !token) {
+  if (!rawDomain || !token) {
     throw new Error('Shopify Admin API not configured');
   }
-  const url = `https://${domain}.myshopify.com/admin/api/${ADMIN_API_VERSION}/graphql.json`;
+  const host = rawDomain.includes('.myshopify.com') ? rawDomain : `${rawDomain}.myshopify.com`;
+  const url = `https://${host}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
@@ -589,20 +596,74 @@ async function fetchEptCatalog(env?: Env): Promise<any | null> {
 
 app.get('/api/catalog', async (c) => {
   try {
-    // Try Shopify first if configured
+    // Try Shopify Storefront API first if configured
     if (c.env.SHOPIFY_STOREFRONT_TOKEN) {
-      const cached = await c.env.CACHE.get('products:all', 'json');
-      if (cached) return c.json({ source: 'shopify', ...(cached as object) });
+      const cacheKey = 'catalog:shopify';
+      const cached = await c.env.CACHE.get(cacheKey, 'json');
+      if (cached) return c.json(cached);
+
+      try {
+        const query = `{
+          products(first: 50) {
+            edges {
+              node {
+                id title description handle productType tags vendor availableForSale
+                priceRange { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } }
+                variants(first: 10) { edges { node { id title price { amount currencyCode } availableForSale selectedOptions { name value } } } }
+                metafields(identifiers: [{ namespace: "echo", key: "service_id" }, { namespace: "echo", key: "category" }]) { key value namespace }
+              }
+            }
+          }
+        }`;
+        const raw = await storefrontQuery(c.env, query);
+        const edges = (raw as any)?.data?.products?.edges || [];
+        const products = edges.map((e: any) => {
+          const n = e.node;
+          const serviceId = n.metafields?.find((m: any) => m?.key === 'service_id')?.value;
+          const category = n.metafields?.find((m: any) => m?.key === 'category')?.value || n.productType;
+          return {
+            id: serviceId || n.handle,
+            title: n.title,
+            description: n.description,
+            handle: n.handle,
+            product_type: n.productType,
+            category,
+            tags: n.tags,
+            available: n.availableForSale,
+            price_range: n.priceRange,
+            variants: (n.variants?.edges || []).map((v: any) => ({
+              id: v.node.id,
+              title: v.node.title,
+              price: v.node.price?.amount,
+              currency: v.node.price?.currencyCode,
+              available: v.node.availableForSale,
+              options: v.node.selectedOptions,
+            })),
+            checkout_url: `https://echo-ept.com/checkout?service=${serviceId || n.handle}`,
+          };
+        });
+        const catalog = {
+          source: 'shopify',
+          total: products.length,
+          products,
+          categories: [...new Set(products.map((p: any) => p.category).filter(Boolean))],
+          cached_at: new Date().toISOString(),
+        };
+        await c.env.CACHE.put(cacheKey, JSON.stringify(catalog), { expirationTtl: 21600 });
+        log('info', 'catalog', 'Shopify catalog served', { count: products.length });
+        return c.json(catalog);
+      } catch (sfErr: any) {
+        log('warn', 'catalog', 'Shopify Storefront query failed, falling back to ept-api', { error: sfErr.message });
+      }
     }
 
-    // Serve from KV cache (populated by cron every 6h, or on first request via external fetch)
+    // Fallback: serve from KV cache or ept-api service binding
     const cached = await c.env.CACHE.get('catalog:ept', 'json');
     if (cached) return c.json(cached);
 
-    // Cache miss — fetch via service binding
     const catalog = await fetchEptCatalog(c.env);
     if (catalog) {
-      await c.env.CACHE.put('catalog:ept', JSON.stringify(catalog), { expirationTtl: 21600 }); // 6h
+      await c.env.CACHE.put('catalog:ept', JSON.stringify(catalog), { expirationTtl: 21600 });
       log('info', 'catalog', 'Cached ept-api catalog on first request', { count: catalog.total });
       return c.json(catalog);
     }
@@ -703,7 +764,7 @@ app.post('/api/admin/register-webhooks', requireAuth, async (c) => {
     for (const topic of webhookTopics) {
       const query = `mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
         webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
-          webhookSubscription { id topic { name } endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } } }
+          webhookSubscription { id topic endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } } }
           userErrors { field message }
         }
       }`;
