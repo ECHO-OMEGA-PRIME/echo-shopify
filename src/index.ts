@@ -46,6 +46,8 @@ function log(level: string, component: string, message: string, extra: Record<st
 
 // ─── HEALTH ──────────────────────────────────────────────────────────────────
 
+app.get("/", (c) => c.json({ service: 'echo-shopify', status: 'operational' }));
+
 app.get('/health', (c) => {
   return c.json({
     status: 'ok',
