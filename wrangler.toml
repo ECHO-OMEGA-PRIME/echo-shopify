@@ -30,3 +30,7 @@ crons = ["0 */6 * * *", "0 14 * * *"]
 [vars]
 STORE_DOMAIN = "bqsee6-mp.myshopify.com"
 ENVIRONMENT = "production"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
