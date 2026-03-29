@@ -28,6 +28,7 @@ service = "ept-api"
 crons = ["0 */6 * * *", "0 14 * * *"]
 
 [vars]
+WORKER_VERSION = "2.0.0"
 STORE_DOMAIN = "bqsee6-mp.myshopify.com"
 ENVIRONMENT = "production"
 

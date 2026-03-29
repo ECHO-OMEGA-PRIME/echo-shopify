@@ -1,5 +1,5 @@
 /**
- * ECHO SHOPIFY INTEGRATION WORKER v1.0.0
+ * ECHO SHOPIFY INTEGRATION WORKER v2.0.0
  * Echo Prime Technologies - Shopify Storefront + Admin API Bridge
  *
  * Handles:
@@ -17,6 +17,7 @@ import { cors } from 'hono/cors';
 interface Env {
   DB: D1Database;
   CACHE: KVNamespace;
+  ANALYTICS: AnalyticsEngineDataset;
   ECHO_CHAT: Fetcher;
   SHARED_BRAIN: Fetcher;
   EPT_API: Fetcher;
@@ -27,6 +28,8 @@ interface Env {
   ECHO_API_KEY: string;
   STORE_DOMAIN: string;
   ENVIRONMENT: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -54,18 +57,61 @@ function log(level: string, component: string, message: string, extra: Record<st
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, component, message, worker: 'echo-shopify', ...extra }));
 }
 
+// ─── Stripe Signature Verification (HMAC-SHA256, constant-time XOR, 5-min replay) ───
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) { const eq = p.indexOf('='); if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim(); }
+  const ts = parts['t']; const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+  if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0; for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
+
+// ─── Stripe API Helper ───
+async function stripeAPI(env: Env, method: string, endpoint: string, body?: Record<string, string>): Promise<unknown> {
+  const opts: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  };
+  if (body) opts.body = new URLSearchParams(body).toString();
+  const res = await fetch(`https://api.stripe.com/v1${endpoint}`, opts);
+  return res.json();
+}
+
+// ─── Billing Plans ───
+const SHOPIFY_PLANS: Record<string, { name: string; price: number; stores: number | 'unlimited'; products: number | 'unlimited' }> = {
+  starter:    { name: 'Starter',    price: 2999,  stores: 1,          products: 500 },
+  business:   { name: 'Business',   price: 7999,  stores: 5,          products: 5000 },
+  enterprise: { name: 'Enterprise', price: 19999, stores: 'unlimited', products: 'unlimited' },
+};
+
 // ─── HEALTH ──────────────────────────────────────────────────────────────────
 
-app.get("/", (c) => c.json({ service: 'echo-shopify', status: 'operational' }));
+app.get("/", (c) => c.json({
+  service: 'echo-shopify',
+  version: '2.0.0',
+  status: 'operational',
+  description: 'Shopify E-Commerce Sync + Stripe Billing',
+  billing: true,
+}));
 
 app.get('/health', (c) => {
   return c.json({
     status: 'ok',
-    version: '1.1.0',
+    version: '2.0.0',
     worker: 'echo-shopify',
     timestamp: new Date().toISOString(),
     shopify_store: c.env.SHOPIFY_STORE_DOMAIN || c.env.STORE_DOMAIN || 'not-configured',
-    features: ['storefront-api', 'admin-api', 'webhooks', 'product-sync', 'auto-fulfillment', 'analytics'],
+    stripe_configured: !!(c.env.STRIPE_SECRET_KEY && c.env.STRIPE_WEBHOOK_SECRET),
+    features: ['storefront-api', 'admin-api', 'webhooks', 'product-sync', 'auto-fulfillment', 'analytics', 'stripe-billing'],
   });
 });
 
@@ -740,7 +786,7 @@ app.get('/api/admin/config', requireAuth, async (c) => {
       shared_brain: 'connected (service binding)',
     },
     worker: {
-      version: '1.1.0',
+      version: '2.0.0',
       d1_database: 'echo-shopify',
       kv_namespace: 'CACHE',
       crons: ['0 */6 * * * (catalog sync)', '0 14 * * * (daily report)'],
@@ -885,6 +931,295 @@ async function handleCron(env: Env) {
   // Invalidate Shopify product cache (will be re-fetched on next request)
   await env.CACHE.delete('products:all');
 }
+
+// ═══════════════════════════════════════════════════════════════
+// ─── Stripe Billing Endpoints ───
+// ═══════════════════════════════════════════════════════════════
+
+// ─── GET /plans ───
+app.get('/plans', (c) => {
+  const plans = Object.entries(SHOPIFY_PLANS).map(([id, p]) => ({
+    id,
+    name: p.name,
+    price_cents: p.price,
+    price_display: `$${(p.price / 100).toFixed(2)}/mo`,
+    stores: p.stores,
+    products: p.products,
+  }));
+  return c.json({ plans });
+});
+
+// ─── POST /plans/upgrade ───
+app.post('/plans/upgrade', requireAuth, async (c) => {
+  const body = await c.req.json<{ customer_id: string; plan: string }>();
+  if (!body.customer_id) return c.json({ error: 'customer_id required' }, 400);
+  const plan = SHOPIFY_PLANS[body.plan];
+  if (!plan) return c.json({ error: 'Invalid plan. Valid: starter, business, enterprise' }, 400);
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+
+  // Get current subscription
+  const sub = await c.env.DB.prepare(
+    'SELECT * FROM subscriptions WHERE stripe_customer_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(body.customer_id, 'active').first<{ stripe_subscription_id: string; plan: string }>();
+
+  if (!sub) return c.json({ error: 'No active subscription found' }, 404);
+  if (sub.plan === body.plan) return c.json({ error: 'Already on this plan' }, 400);
+
+  // Retrieve subscription items from Stripe
+  const stripeSub = await stripeAPI(c.env, 'GET', `/subscriptions/${sub.stripe_subscription_id}`) as {
+    items: { data: Array<{ id: string }> };
+  };
+  const itemId = stripeSub.items?.data?.[0]?.id;
+  if (!itemId) return c.json({ error: 'Could not retrieve subscription item' }, 500);
+
+  // Update subscription with new price
+  const updated = await stripeAPI(c.env, 'POST', `/subscriptions/${sub.stripe_subscription_id}`, {
+    'items[0][id]': itemId,
+    'items[0][price_data][currency]': 'usd',
+    'items[0][price_data][unit_amount]': plan.price.toString(),
+    'items[0][price_data][recurring][interval]': 'month',
+    'items[0][price_data][product_data][name]': `Echo Shopify — ${plan.name}`,
+    proration_behavior: 'create_prorations',
+    'metadata[plan]': body.plan,
+    'metadata[stores_limit]': String(plan.stores),
+    'metadata[products_limit]': String(plan.products),
+  }) as { id: string; status: string };
+
+  // Update local DB
+  await c.env.DB.prepare(
+    `UPDATE subscriptions SET plan = ?, stores_limit = ?, products_limit = ?, updated_at = datetime('now') WHERE stripe_customer_id = ?`
+  ).bind(body.plan, plan.stores === 'unlimited' ? -1 : plan.stores, plan.products === 'unlimited' ? -1 : plan.products, body.customer_id).run();
+
+  log('info', 'billing', 'Plan upgraded', { customer: body.customer_id, from: sub.plan, to: body.plan });
+  c.env.ANALYTICS.writeDataPoint({ blobs: ['plan_upgrade', body.plan], doubles: [plan.price] });
+
+  return c.json({
+    success: true,
+    subscription_id: updated.id,
+    new_plan: body.plan,
+    new_price: `$${(plan.price / 100).toFixed(2)}/mo`,
+    stores_limit: plan.stores,
+    products_limit: plan.products,
+  });
+});
+
+// ─── Billing: Create Checkout Session ───
+app.post('/billing/checkout', requireAuth, async (c) => {
+  const body = await c.req.json<{ plan: string; customer_email: string; success_url?: string; cancel_url?: string }>();
+  const plan = SHOPIFY_PLANS[body.plan];
+  if (!plan) return c.json({ error: 'Invalid plan. Valid: starter, business, enterprise' }, 400);
+  if (!body.customer_email) return c.json({ error: 'customer_email required' }, 400);
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+
+  const session = await stripeAPI(c.env, 'POST', '/checkout/sessions', {
+    mode: 'subscription',
+    'line_items[0][price_data][currency]': 'usd',
+    'line_items[0][price_data][unit_amount]': plan.price.toString(),
+    'line_items[0][price_data][recurring][interval]': 'month',
+    'line_items[0][price_data][product_data][name]': `Echo Shopify — ${plan.name}`,
+    'line_items[0][price_data][product_data][description]': `${plan.stores === 'unlimited' ? 'Unlimited' : plan.stores} store(s), ${plan.products === 'unlimited' ? 'Unlimited' : plan.products} products`,
+    'line_items[0][quantity]': '1',
+    customer_email: body.customer_email,
+    success_url: body.success_url || 'https://echo-ept.com/shopify?billing=success',
+    cancel_url: body.cancel_url || 'https://echo-ept.com/shopify?billing=cancelled',
+    'metadata[plan]': body.plan,
+    'metadata[worker]': 'echo-shopify',
+    'metadata[stores_limit]': String(plan.stores),
+    'metadata[products_limit]': String(plan.products),
+  }) as { id: string; url: string };
+
+  log('info', 'billing', 'Checkout session created', { plan: body.plan, email: body.customer_email });
+  c.env.ANALYTICS.writeDataPoint({ blobs: ['checkout_created', body.plan], doubles: [plan.price] });
+  return c.json({ session_id: session.id, checkout_url: session.url });
+});
+
+// ─── Billing: Customer Portal ───
+app.post('/billing/portal', requireAuth, async (c) => {
+  const body = await c.req.json<{ customer_id: string; return_url?: string }>();
+  if (!body.customer_id) return c.json({ error: 'customer_id required' }, 400);
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+
+  const portal = await stripeAPI(c.env, 'POST', '/billing_portal/sessions', {
+    customer: body.customer_id,
+    return_url: body.return_url || 'https://echo-ept.com/shopify',
+  }) as { url: string };
+
+  return c.json({ portal_url: portal.url });
+});
+
+// ─── Billing: Subscription Status ───
+app.get('/billing/status/:customerId', requireAuth, async (c) => {
+  const customerId = c.req.param('customerId');
+  const sub = await c.env.DB.prepare(
+    'SELECT * FROM subscriptions WHERE stripe_customer_id = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(customerId).first();
+
+  if (!sub) return c.json({ subscribed: false, plan: null });
+
+  return c.json({
+    subscribed: (sub as any).status === 'active',
+    plan: (sub as any).plan,
+    status: (sub as any).status,
+    stripe_subscription_id: (sub as any).stripe_subscription_id,
+    stores_limit: (sub as any).stores_limit,
+    products_limit: (sub as any).products_limit,
+    current_period_end: (sub as any).current_period_end,
+  });
+});
+
+// ─── Stripe Webhook (exempt from auth) ───
+app.post('/webhooks/stripe', async (c) => {
+  const payload = await c.req.text();
+  const sigHeader = c.req.header('stripe-signature') || '';
+
+  if (!c.env.STRIPE_WEBHOOK_SECRET) {
+    log('warn', 'stripe', 'STRIPE_WEBHOOK_SECRET not configured');
+    return c.json({ error: 'Webhook secret not configured' }, 503);
+  }
+
+  const valid = await verifyStripeSignature(payload, sigHeader, c.env.STRIPE_WEBHOOK_SECRET);
+  if (!valid) {
+    log('warn', 'stripe', 'Invalid Stripe signature on webhook');
+    return c.json({ error: 'Invalid signature' }, 401);
+  }
+
+  const event = JSON.parse(payload);
+  log('info', 'stripe', 'Stripe webhook received', { type: event.type, id: event.id });
+  c.env.ANALYTICS.writeDataPoint({ blobs: ['stripe_webhook', event.type], doubles: [1] });
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const plan = session.metadata?.plan || 'starter';
+      const planData = SHOPIFY_PLANS[plan];
+      await c.env.DB.prepare(
+        `INSERT INTO subscriptions (stripe_customer_id, stripe_subscription_id, plan, status, stores_limit, products_limit, customer_email, current_period_end, created_at, updated_at)
+         VALUES (?, ?, ?, 'active', ?, ?, ?, datetime(?, 'unixepoch'), datetime('now'), datetime('now'))
+         ON CONFLICT(stripe_customer_id) DO UPDATE SET
+           stripe_subscription_id = excluded.stripe_subscription_id,
+           plan = excluded.plan,
+           status = 'active',
+           stores_limit = excluded.stores_limit,
+           products_limit = excluded.products_limit,
+           current_period_end = excluded.current_period_end,
+           updated_at = datetime('now')`
+      ).bind(
+        session.customer,
+        session.subscription,
+        plan,
+        planData ? (planData.stores === 'unlimited' ? -1 : planData.stores) : 1,
+        planData ? (planData.products === 'unlimited' ? -1 : planData.products) : 500,
+        session.customer_details?.email || '',
+        Math.floor(Date.now() / 1000) + 30 * 86400,
+      ).run();
+      log('info', 'stripe', 'Subscription created', { customer: session.customer, plan });
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      const sub = event.data.object;
+      await c.env.DB.prepare(
+        `UPDATE subscriptions SET status = ?, current_period_end = datetime(?, 'unixepoch'), updated_at = datetime('now')
+         WHERE stripe_subscription_id = ?`
+      ).bind(sub.status, sub.current_period_end, sub.id).run();
+      log('info', 'stripe', 'Subscription updated', { sub_id: sub.id, status: sub.status });
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object;
+      await c.env.DB.prepare(
+        `UPDATE subscriptions SET status = 'cancelled', updated_at = datetime('now')
+         WHERE stripe_subscription_id = ?`
+      ).bind(sub.id).run();
+      log('info', 'stripe', 'Subscription cancelled', { sub_id: sub.id });
+      break;
+    }
+
+    case 'invoice.payment_succeeded': {
+      const invoice = event.data.object;
+      await c.env.DB.prepare(
+        `INSERT INTO payment_history (stripe_customer_id, stripe_invoice_id, amount_cents, currency, status, plan, created_at)
+         VALUES (?, ?, ?, ?, 'paid', ?, datetime('now'))`
+      ).bind(invoice.customer, invoice.id, invoice.amount_paid, invoice.currency, invoice.lines?.data?.[0]?.metadata?.plan || 'unknown').run();
+      log('info', 'stripe', 'Payment recorded', { customer: invoice.customer, amount: invoice.amount_paid });
+      break;
+    }
+
+    case 'invoice.payment_failed': {
+      const invoice = event.data.object;
+      await c.env.DB.prepare(
+        `UPDATE subscriptions SET status = 'past_due', updated_at = datetime('now')
+         WHERE stripe_customer_id = ?`
+      ).bind(invoice.customer).run();
+      log('warn', 'stripe', 'Payment failed', { customer: invoice.customer });
+      break;
+    }
+
+    default:
+      log('info', 'stripe', 'Unhandled Stripe event', { type: event.type });
+  }
+
+  return c.json({ received: true });
+});
+
+// ─── Admin: Billing Stats ───
+app.get('/billing/stats', requireAuth, async (c) => {
+  const [active, cancelled, revenue, pastDue] = await Promise.all([
+    c.env.DB.prepare("SELECT COUNT(*) as count FROM subscriptions WHERE status = 'active'").first<{ count: number }>(),
+    c.env.DB.prepare("SELECT COUNT(*) as count FROM subscriptions WHERE status = 'cancelled'").first<{ count: number }>(),
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount_cents), 0) as total FROM payment_history WHERE status = 'paid'").first<{ total: number }>(),
+    c.env.DB.prepare("SELECT COUNT(*) as count FROM subscriptions WHERE status = 'past_due'").first<{ count: number }>(),
+  ]);
+
+  return c.json({
+    active_subscriptions: active?.count || 0,
+    cancelled_subscriptions: cancelled?.count || 0,
+    past_due: pastDue?.count || 0,
+    total_revenue_cents: revenue?.total || 0,
+    total_revenue_display: `$${((revenue?.total || 0) / 100).toFixed(2)}`,
+  });
+});
+
+// ─── Admin: Migrate Stripe Schema ───
+app.post('/admin/migrate-stripe', requireAuth, async (c) => {
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      stripe_customer_id TEXT UNIQUE NOT NULL,
+      stripe_subscription_id TEXT,
+      plan TEXT NOT NULL DEFAULT 'starter',
+      status TEXT NOT NULL DEFAULT 'active',
+      stores_limit INTEGER DEFAULT 1,
+      products_limit INTEGER DEFAULT 500,
+      customer_email TEXT,
+      current_period_end TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`,
+    `CREATE TABLE IF NOT EXISTS payment_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      stripe_customer_id TEXT NOT NULL,
+      stripe_invoice_id TEXT UNIQUE,
+      amount_cents INTEGER NOT NULL,
+      currency TEXT DEFAULT 'usd',
+      status TEXT NOT NULL,
+      plan TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_customer ON subscriptions(stripe_customer_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_status ON subscriptions(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_pay_customer ON payment_history(stripe_customer_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pay_invoice ON payment_history(stripe_invoice_id)`,
+  ];
+
+  for (const stmt of statements) {
+    await c.env.DB.prepare(stmt).run();
+  }
+
+  log('info', 'admin', 'Stripe billing schema migrated');
+  return c.json({ success: true, message: 'Stripe billing tables created', tables: ['subscriptions', 'payment_history'] });
+});
 
 // ─── 404 ─────────────────────────────────────────────────────────────────────
 
